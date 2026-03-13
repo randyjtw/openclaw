@@ -897,6 +897,77 @@ describe("web_search minimax provider", () => {
     expect(secondBody.q).toBe("first-query");
     expect(thirdBody.q).toBe("second-query");
   });
+
+  it("falls back to MiniMax when Brave is configured but Brave key is missing", async () => {
+    vi.stubEnv("BRAVE_API_KEY", "");
+    vi.stubEnv("MINIMAX_API_KEY", "");
+    vi.stubEnv("MINIMAX_OAUTH_TOKEN", "minimax-oauth-token");
+    const mockFetch = installMockFetch({
+      base_resp: { status_code: 0, status_msg: "ok" },
+      organic: [{ title: "MiniMax", link: "https://example.com", snippet: "snippet" }],
+    });
+    const tool = createWebSearchTool({
+      config: {
+        tools: {
+          web: {
+            search: {
+              provider: "brave",
+            },
+          },
+        },
+      },
+      sandboxed: true,
+    });
+    const result = await tool?.execute?.("call-1", { query: "fallback to minimax" });
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const verifyUrl = new URL(String(mockFetch.mock.calls[0]?.[0]));
+    const searchUrl = new URL(String(mockFetch.mock.calls[1]?.[0]));
+    expect(verifyUrl.pathname).toBe("/v1/coding_plan/search");
+    expect(searchUrl.pathname).toBe("/v1/coding_plan/search");
+    expect((result?.details as { provider?: string } | undefined)?.provider).toBe("minimax");
+  });
+
+  it("shows MiniMax subscription hint only when OAuth credentials are present", async () => {
+    const failingProbePayload = {
+      base_resp: { status_code: 401, status_msg: "forbidden" },
+      organic: [],
+    };
+
+    vi.stubEnv("BRAVE_API_KEY", "");
+    vi.stubEnv("MINIMAX_API_KEY", "");
+    vi.stubEnv("MINIMAX_OAUTH_TOKEN", "minimax-oauth-token");
+    installMockFetch(failingProbePayload);
+    const oauthTool = createWebSearchTool({
+      config: {
+        tools: {
+          web: {
+            search: {
+              provider: "brave",
+            },
+          },
+        },
+      },
+      sandboxed: true,
+    });
+    const oauthResult = await oauthTool?.execute?.("call-oauth", { query: "probe fail oauth" });
+    const oauthMessage = String(
+      (oauthResult?.details as { message?: string } | undefined)?.message ?? "",
+    );
+    expect(oauthResult?.details).toMatchObject({ error: "minimax_search_unavailable" });
+    expect(oauthMessage).toContain("Coding Plan subscription/entitlement");
+
+    vi.stubEnv("MINIMAX_OAUTH_TOKEN", "");
+    vi.stubEnv("MINIMAX_API_KEY", "minimax-api-key");
+    installMockFetch(failingProbePayload);
+    const apiKeyTool = createMinimaxSearchTool();
+    const apiKeyResult = await apiKeyTool?.execute?.("call-api-key", { query: "probe fail key" });
+    const apiKeyMessage = String(
+      (apiKeyResult?.details as { message?: string } | undefined)?.message ?? "",
+    );
+    expect(apiKeyResult?.details).toMatchObject({ error: "minimax_search_unavailable" });
+    expect(apiKeyMessage).not.toContain("Coding Plan subscription/entitlement");
+  });
 });
 
 describe("web_search external content wrapping", () => {

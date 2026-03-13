@@ -49,7 +49,7 @@ const DEFAULT_MINIMAX_API_HOST = "https://api.minimax.io";
 const MINIMAX_SEARCH_PATH = "/v1/coding_plan/search";
 const MINIMAX_VERIFY_QUERY = "ping";
 const MINIMAX_VERIFY_COUNT = 1;
-const MINIMAX_VERIFY_DEFAULT_TTL_MS = 15 * 60 * 1000;
+const MINIMAX_VERIFY_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 const KIMI_WEB_SEARCH_TOOL = {
   type: "builtin_function",
   function: { name: "$web_search" },
@@ -652,6 +652,26 @@ function missingSearchKeyPayload(provider: (typeof SEARCH_PROVIDERS)[number]) {
   };
 }
 
+function minimaxUnavailablePayload(
+  reason: string,
+  params?: { includeApiFallbackHint?: boolean; includeSubscriptionHint?: boolean },
+) {
+  const fallbackHint = params?.includeApiFallbackHint
+    ? " Configure BRAVE_API_KEY (or another web_search provider key) if you need a non-MiniMax fallback."
+    : "";
+  const subscriptionHint = params?.includeSubscriptionHint
+    ? " If you are using OAuth, verify your MiniMax Coding Plan subscription/entitlement is active."
+    : "";
+  return {
+    error: "minimax_search_unavailable",
+    message:
+      `web_search (minimax) is unavailable for the current credentials. ${reason}` +
+      subscriptionHint +
+      fallbackHint,
+    docs: "https://docs.openclaw.ai/tools/web",
+  };
+}
+
 function resolveSearchProvider(search?: WebSearchConfig): (typeof SEARCH_PROVIDERS)[number] {
   const raw =
     search && "provider" in search && typeof search.provider === "string"
@@ -973,6 +993,21 @@ function resolveMinimaxApiKey(minimax?: MinimaxConfig): string | undefined {
   }
   const fromEnvApiKey = normalizeApiKey(process.env.MINIMAX_API_KEY);
   return fromEnvApiKey || undefined;
+}
+
+function hasMinimaxOauthCredential(params: {
+  minimax?: MinimaxConfig;
+  minimaxRuntime?: { apiKey?: string };
+}): boolean {
+  if (normalizeApiKey(process.env.MINIMAX_OAUTH_TOKEN)) {
+    return true;
+  }
+  const hasExplicitApiKey = Boolean(
+    normalizeApiKey(params.minimax?.apiKey) || normalizeApiKey(process.env.MINIMAX_API_KEY),
+  );
+  // If credentials exist but neither config/env API keys are set, they were resolved
+  // from auth profiles, which in most deployments means OAuth.
+  return !hasExplicitApiKey && Boolean(params.minimaxRuntime?.apiKey);
 }
 
 async function resolveMinimaxRuntimeCredentials(params: {
@@ -2315,7 +2350,7 @@ export function createWebSearchTool(options?: {
       // do not touch Perplexity-only credential surfaces during tool construction.
       const perplexityRuntime =
         provider === "perplexity" ? resolvePerplexityTransport(perplexityConfig) : undefined;
-      const minimaxRuntime =
+      let minimaxRuntime =
         provider === "minimax"
           ? await resolveMinimaxRuntimeCredentials({
               cfg: options?.config,
@@ -2323,7 +2358,8 @@ export function createWebSearchTool(options?: {
               runtimeWebSearch: options?.runtimeWebSearch,
             })
           : undefined;
-      const apiKey =
+      let effectiveProvider = provider;
+      let effectiveApiKey =
         provider === "perplexity"
           ? perplexityRuntime?.apiKey
           : provider === "grok"
@@ -2336,33 +2372,79 @@ export function createWebSearchTool(options?: {
                   ? resolveGeminiApiKey(geminiConfig)
                   : resolveSearchApiKey(search);
 
-      if (!apiKey) {
-        return jsonResult(missingSearchKeyPayload(provider));
-      }
-
       const timeoutSeconds = resolveTimeoutSeconds(search?.timeoutSeconds, DEFAULT_TIMEOUT_SECONDS);
-      const minimaxApiHost = resolveMinimaxApiHost({
+      let minimaxApiHost = resolveMinimaxApiHost({
         cfg: options?.config,
         minimax: minimaxConfig,
         runtimeApiHost: minimaxRuntime?.apiHost ?? options?.runtimeWebSearch?.minimaxApiHost,
       });
-      if (provider === "minimax") {
+      let minimaxVerified = false;
+
+      if (!effectiveApiKey) {
+        if (provider === "brave") {
+          minimaxRuntime =
+            minimaxRuntime ??
+            (await resolveMinimaxRuntimeCredentials({
+              cfg: options?.config,
+              minimax: minimaxConfig,
+              runtimeWebSearch: options?.runtimeWebSearch,
+            }));
+          if (minimaxRuntime?.apiKey) {
+            minimaxApiHost = resolveMinimaxApiHost({
+              cfg: options?.config,
+              minimax: minimaxConfig,
+              runtimeApiHost: minimaxRuntime.apiHost ?? options?.runtimeWebSearch?.minimaxApiHost,
+            });
+            const verify = await verifyMinimaxSearchAccess({
+              apiKey: minimaxRuntime.apiKey,
+              apiHost: minimaxApiHost,
+              timeoutSeconds,
+            });
+            if (!verify.ok) {
+              return jsonResult(
+                minimaxUnavailablePayload(verify.reason, {
+                  includeApiFallbackHint: true,
+                  includeSubscriptionHint: hasMinimaxOauthCredential({
+                    minimax: minimaxConfig,
+                    minimaxRuntime,
+                  }),
+                }),
+              );
+            }
+            logVerbose(
+              'web_search: provider "brave" missing key; auto-falling back to "minimax" credentials',
+            );
+            effectiveProvider = "minimax";
+            effectiveApiKey = minimaxRuntime.apiKey;
+            minimaxVerified = true;
+          } else {
+            return jsonResult(missingSearchKeyPayload(provider));
+          }
+        } else {
+          return jsonResult(missingSearchKeyPayload(provider));
+        }
+      }
+
+      if (effectiveProvider === "minimax" && !minimaxVerified) {
         const verify = await verifyMinimaxSearchAccess({
-          apiKey,
+          apiKey: effectiveApiKey,
           apiHost: minimaxApiHost,
           timeoutSeconds,
         });
         if (!verify.ok) {
-          return jsonResult({
-            error: "minimax_search_unavailable",
-            message: `web_search (minimax) credential probe failed for coding_plan/search. ${verify.reason}`,
-            docs: "https://docs.openclaw.ai/tools/web",
-          });
+          return jsonResult(
+            minimaxUnavailablePayload(verify.reason, {
+              includeSubscriptionHint: hasMinimaxOauthCredential({
+                minimax: minimaxConfig,
+                minimaxRuntime,
+              }),
+            }),
+          );
         }
       }
 
       const supportsStructuredPerplexityFilters =
-        provider === "perplexity" && perplexityRuntime?.transport === "search_api";
+        effectiveProvider === "perplexity" && perplexityRuntime?.transport === "search_api";
       const params = args as Record<string, unknown>;
       const query = readStringParam(params, "query", { required: true });
       const count =
@@ -2370,34 +2452,34 @@ export function createWebSearchTool(options?: {
       const country = readStringParam(params, "country");
       if (
         country &&
-        provider !== "brave" &&
-        !(provider === "perplexity" && supportsStructuredPerplexityFilters)
+        effectiveProvider !== "brave" &&
+        !(effectiveProvider === "perplexity" && supportsStructuredPerplexityFilters)
       ) {
         return jsonResult({
           error: "unsupported_country",
           message:
-            provider === "perplexity"
+            effectiveProvider === "perplexity"
               ? "country filtering is only supported by the native Perplexity Search API path. Remove Perplexity baseUrl/model overrides or use a direct PERPLEXITY_API_KEY to enable it."
-              : `country filtering is not supported by the ${provider} provider. Only Brave and Perplexity support country filtering.`,
+              : `country filtering is not supported by the ${effectiveProvider} provider. Only Brave and Perplexity support country filtering.`,
           docs: "https://docs.openclaw.ai/tools/web",
         });
       }
       const language = readStringParam(params, "language");
       if (
         language &&
-        provider !== "brave" &&
-        !(provider === "perplexity" && supportsStructuredPerplexityFilters)
+        effectiveProvider !== "brave" &&
+        !(effectiveProvider === "perplexity" && supportsStructuredPerplexityFilters)
       ) {
         return jsonResult({
           error: "unsupported_language",
           message:
-            provider === "perplexity"
+            effectiveProvider === "perplexity"
               ? "language filtering is only supported by the native Perplexity Search API path. Remove Perplexity baseUrl/model overrides or use a direct PERPLEXITY_API_KEY to enable it."
-              : `language filtering is not supported by the ${provider} provider. Only Brave and Perplexity support language filtering.`,
+              : `language filtering is not supported by the ${effectiveProvider} provider. Only Brave and Perplexity support language filtering.`,
           docs: "https://docs.openclaw.ai/tools/web",
         });
       }
-      if (language && provider === "perplexity" && !/^[a-z]{2}$/i.test(language)) {
+      if (language && effectiveProvider === "perplexity" && !/^[a-z]{2}$/i.test(language)) {
         return jsonResult({
           error: "invalid_language",
           message: "language must be a 2-letter ISO 639-1 code like 'en', 'de', or 'fr'.",
@@ -2408,7 +2490,7 @@ export function createWebSearchTool(options?: {
       const ui_lang = readStringParam(params, "ui_lang");
       // For Brave, accept both `language` (unified) and `search_lang`
       const normalizedBraveLanguageParams =
-        provider === "brave"
+        effectiveProvider === "brave"
           ? normalizeBraveLanguageParams({ search_lang: search_lang || language, ui_lang })
           : { search_lang: language, ui_lang };
       if (normalizedBraveLanguageParams.invalidField === "search_lang") {
@@ -2428,7 +2510,7 @@ export function createWebSearchTool(options?: {
       }
       const resolvedSearchLang = normalizedBraveLanguageParams.search_lang;
       const resolvedUiLang = normalizedBraveLanguageParams.ui_lang;
-      if (resolvedUiLang && provider === "brave" && braveMode === "llm-context") {
+      if (resolvedUiLang && effectiveProvider === "brave" && braveMode === "llm-context") {
         return jsonResult({
           error: "unsupported_ui_lang",
           message:
@@ -2437,14 +2519,14 @@ export function createWebSearchTool(options?: {
         });
       }
       const rawFreshness = readStringParam(params, "freshness");
-      if (rawFreshness && provider !== "brave" && provider !== "perplexity") {
+      if (rawFreshness && effectiveProvider !== "brave" && effectiveProvider !== "perplexity") {
         return jsonResult({
           error: "unsupported_freshness",
-          message: `freshness filtering is not supported by the ${provider} provider. Only Brave and Perplexity support freshness.`,
+          message: `freshness filtering is not supported by the ${effectiveProvider} provider. Only Brave and Perplexity support freshness.`,
           docs: "https://docs.openclaw.ai/tools/web",
         });
       }
-      if (rawFreshness && provider === "brave" && braveMode === "llm-context") {
+      if (rawFreshness && effectiveProvider === "brave" && braveMode === "llm-context") {
         return jsonResult({
           error: "unsupported_freshness",
           message:
@@ -2452,7 +2534,9 @@ export function createWebSearchTool(options?: {
           docs: "https://docs.openclaw.ai/tools/web",
         });
       }
-      const freshness = rawFreshness ? normalizeFreshness(rawFreshness, provider) : undefined;
+      const freshness = rawFreshness
+        ? normalizeFreshness(rawFreshness, effectiveProvider)
+        : undefined;
       if (rawFreshness && !freshness) {
         return jsonResult({
           error: "invalid_freshness",
@@ -2472,19 +2556,23 @@ export function createWebSearchTool(options?: {
       }
       if (
         (rawDateAfter || rawDateBefore) &&
-        provider !== "brave" &&
-        !(provider === "perplexity" && supportsStructuredPerplexityFilters)
+        effectiveProvider !== "brave" &&
+        !(effectiveProvider === "perplexity" && supportsStructuredPerplexityFilters)
       ) {
         return jsonResult({
           error: "unsupported_date_filter",
           message:
-            provider === "perplexity"
+            effectiveProvider === "perplexity"
               ? "date_after/date_before are only supported by the native Perplexity Search API path. Remove Perplexity baseUrl/model overrides or use a direct PERPLEXITY_API_KEY to enable them."
-              : `date_after/date_before filtering is not supported by the ${provider} provider. Only Brave and Perplexity support date filtering.`,
+              : `date_after/date_before filtering is not supported by the ${effectiveProvider} provider. Only Brave and Perplexity support date filtering.`,
           docs: "https://docs.openclaw.ai/tools/web",
         });
       }
-      if ((rawDateAfter || rawDateBefore) && provider === "brave" && braveMode === "llm-context") {
+      if (
+        (rawDateAfter || rawDateBefore) &&
+        effectiveProvider === "brave" &&
+        braveMode === "llm-context"
+      ) {
         return jsonResult({
           error: "unsupported_date_filter",
           message:
@@ -2519,14 +2607,14 @@ export function createWebSearchTool(options?: {
       if (
         domainFilter &&
         domainFilter.length > 0 &&
-        !(provider === "perplexity" && supportsStructuredPerplexityFilters)
+        !(effectiveProvider === "perplexity" && supportsStructuredPerplexityFilters)
       ) {
         return jsonResult({
           error: "unsupported_domain_filter",
           message:
-            provider === "perplexity"
+            effectiveProvider === "perplexity"
               ? "domain_filter is only supported by the native Perplexity Search API path. Remove Perplexity baseUrl/model overrides or use a direct PERPLEXITY_API_KEY to enable it."
-              : `domain_filter is not supported by the ${provider} provider. Only Perplexity supports domain filtering.`,
+              : `domain_filter is not supported by the ${effectiveProvider} provider. Only Perplexity supports domain filtering.`,
           docs: "https://docs.openclaw.ai/tools/web",
         });
       }
@@ -2554,7 +2642,7 @@ export function createWebSearchTool(options?: {
       const maxTokens = readNumberParam(params, "max_tokens", { integer: true });
       const maxTokensPerPage = readNumberParam(params, "max_tokens_per_page", { integer: true });
       if (
-        provider === "perplexity" &&
+        effectiveProvider === "perplexity" &&
         perplexityRuntime?.transport === "chat_completions" &&
         (maxTokens !== undefined || maxTokensPerPage !== undefined)
       ) {
@@ -2569,10 +2657,10 @@ export function createWebSearchTool(options?: {
       const result = await runWebSearch({
         query,
         count: resolveSearchCount(count, DEFAULT_SEARCH_COUNT),
-        apiKey,
+        apiKey: effectiveApiKey,
         timeoutSeconds,
         cacheTtlMs: resolveCacheTtlMs(search?.cacheTtlMinutes, DEFAULT_CACHE_TTL_MINUTES),
-        provider,
+        provider: effectiveProvider,
         country,
         language,
         search_lang: resolvedSearchLang,
